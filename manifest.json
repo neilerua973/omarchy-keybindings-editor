@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "lemechant.keybindings-editor",
+  "name": "Keybindings Visualizer + Editor",
+  "version": "1.2.0",
+  "author": "Ming Bao (original), forked and extended locally",
+  "license": "MIT",
+  "description": "Visual on-screen-keyboard view of your Hyprland keybindings, grouped by modifier layer, with in-panel rebinding, app/webapp reassignment, and assignment of brand-new shortcuts to unbound keys.",
+  "kinds": ["panel"],
+  "entryPoints": {
+    "panel": "KeybindingsPanel.qml"
+  }
+}

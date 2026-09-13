@@ -1,0 +1,361 @@
+#!/bin/bash
+# keybindings-data — emit every Hyprland keybinding as one JSON array.
+#
+# Vendors the hyprctl-binds parsing approach from Omarchy's own
+# omarchy-menu-keybindings (/usr/share/omarchy/bin/omarchy-menu-keybindings,
+# Omarchy 4.0.2): plain-text `hyprctl binds` (NOT `-j`, which that script
+# itself avoids because some Hyprland versions emit invalid JSON for
+# binds), the Lua-bind cache for bindings.lua-declared binds, and XKB
+# keycode -> symbol resolution. Unlike `omarchy-menu-keybindings --print`,
+# this keeps the dispatcher and its argument instead of flattening
+# everything into one display string, and upper-cases every key/modifier
+# token so JS-side lookups never special-case casing (hyprctl binds
+# itself is inconsistent, e.g. "DELETE" vs "Home" vs "PRINT").
+#
+# Internal fields are `\x1f`-separated (not comma-separated, unlike the
+# upstream script) so a command containing a comma can't corrupt a row.
+#
+# If a future Omarchy update changes `hyprctl binds`' text layout or the
+# Lua-bind cache format, diff this against the current
+# /usr/share/omarchy/bin/omarchy-menu-keybindings first.
+#
+# Deliberately not `set -u`: the Lua-bind cache below reads possibly-unset
+# associative-array keys by design (missing key = empty string fallback),
+# which `nounset` turns into a hard error.
+set -eo pipefail
+
+declare -A LUA_BIND_KEY_MAP
+declare -A LUA_BIND_DISPATCHER_MAP
+declare -A LUA_BIND_ARG_MAP
+
+parse_keycodes() {
+  awk '
+    BEGIN {
+      split("10=1 11=2 12=3 13=4 14=5 15=6 16=7 17=8 18=9 19=0 20=MINUS 21=EQUAL 59=COMMA 60=PERIOD 61=SLASH", fallbacks, " ")
+      for (i in fallbacks) {
+        separator = index(fallbacks[i], "=")
+        keycode_symbol[substr(fallbacks[i], 1, separator - 1)] = substr(fallbacks[i], separator + 1)
+      }
+      keymap_cmd = "xkbcli compile-keymap </dev/null"
+      section = ""
+      while ((keymap_cmd | getline line) > 0) {
+        if (line ~ /xkb_keycodes/) { section = "codes"; continue }
+        if (line ~ /xkb_symbols/)  { section = "syms";  continue }
+        if (section == "codes" && match(line, /<([A-Za-z0-9_]+)>\s*=\s*([0-9]+)\s*;/, m)) code_by_name[m[1]] = m[2]
+        if (section == "syms" && match(line, /key\s*<([A-Za-z0-9_]+)>\s*\{\s*\[\s*([^, \]]+)/, m)) sym_by_name[m[1]] = m[2]
+      }
+      close(keymap_cmd)
+      for (name in code_by_name) {
+        code = code_by_name[name]
+        symbol = sym_by_name[name]
+        if (code != "" && symbol != "" && symbol != "NoSymbol") keycode_symbol[code] = toupper(symbol)
+      }
+      mouse_symbol["272"] = "LEFT MOUSE BUTTON"
+      mouse_symbol["273"] = "RIGHT MOUSE BUTTON"
+      mouse_symbol["274"] = "MIDDLE MOUSE BUTTON"
+    }
+    {
+      if (match($0, /code:([0-9]+)/, match_parts)) {
+        code = match_parts[1]
+        symbol = keycode_symbol[code]
+        if (symbol == "") symbol = "code:" code
+        sub("code:" code, symbol)
+      } else if (match($0, /mouse:([0-9]+)/, match_parts)) {
+        code = match_parts[1]
+        symbol = mouse_symbol[code]
+        if (symbol == "") symbol = "mouse:" code
+        sub("mouse:" code, symbol)
+      }
+      print
+    }
+  '
+}
+
+build_lua_bind_cache() {
+  local modmask description key dispatcher arg cache_key
+
+  omarchy-cmd-present lua || return 0
+
+  while IFS=$'\t' read -r modmask description key dispatcher arg; do
+    [[ -z $modmask || -z $description || -z $key ]] && continue
+
+    LUA_BIND_KEY_MAP["$modmask,$description"]="$key"
+    cache_key="$modmask,$description,$key"
+    LUA_BIND_DISPATCHER_MAP["$cache_key"]="$dispatcher"
+    LUA_BIND_ARG_MAP["$cache_key"]="$arg"
+  done < <(
+    lua <<'LUA'
+local modifiers = { SHIFT = 1, CTRL = 4, CONTROL = 4, ALT = 8, SUPER = 64 }
+
+local function split_keys(keys)
+  local modmask = 0
+  local key = ""
+
+  for part in string.gmatch(tostring(keys or ""), "[^+]+") do
+    local value = part:gsub("^%s+", ""):gsub("%s+$", "")
+    local modifier = modifiers[string.upper(value)]
+
+    if modifier then
+      modmask = modmask + modifier
+    else
+      key = value
+    end
+  end
+
+  return modmask, key
+end
+
+local function lua_literal(value)
+  local value_type = type(value)
+
+  if value_type == "string" then
+    return string.format("%q", value)
+  elseif value_type == "number" or value_type == "boolean" then
+    return tostring(value)
+  elseif value_type == "table" then
+    local parts = {}
+    local keys = {}
+    local array_length = #value
+
+    for index = 1, array_length do
+      parts[#parts + 1] = lua_literal(value[index])
+    end
+
+    for key in pairs(value) do
+      if not (type(key) == "number" and key >= 1 and key <= array_length and math.floor(key) == key) then
+        keys[#keys + 1] = key
+      end
+    end
+
+    table.sort(keys, function(left, right)
+      return tostring(left) < tostring(right)
+    end)
+
+    for _, key in ipairs(keys) do
+      local key_prefix
+      if type(key) == "string" and key:match("^[%a_][%w_]*$") then
+        key_prefix = key .. " = "
+      else
+        key_prefix = "[" .. lua_literal(key) .. "] = "
+      end
+
+      parts[#parts + 1] = key_prefix .. lua_literal(value[key])
+    end
+
+    return "{ " .. table.concat(parts, ", ") .. " }"
+  elseif value_type == "nil" then
+    return "nil"
+  else
+    return "nil"
+  end
+end
+
+local function call_expression(path, ...)
+  local args = {}
+
+  for index = 1, select("#", ...) do
+    args[index] = lua_literal(select(index, ...))
+  end
+
+  return path .. "(" .. table.concat(args, ", ") .. ")"
+end
+
+local function dispatcher(kind, arg, expr)
+  return {
+    __omarchy_dispatcher = true,
+    kind = kind or "",
+    arg = arg or "",
+    expr = expr or "",
+  }
+end
+
+local function dsp_proxy(path)
+  return setmetatable({ path = path }, {
+    __index = function(self, key)
+      return dsp_proxy(self.path .. "." .. tostring(key))
+    end,
+    __call = function(self, ...)
+      local first_arg = ...
+      local expr = call_expression(self.path, ...)
+
+      if self.path == "hl.dsp.exec_cmd" and type(first_arg) == "string" then
+        return dispatcher("exec", first_arg, expr)
+      end
+
+      return dispatcher("lua", expr, expr)
+    end,
+  })
+end
+
+local noop
+noop = setmetatable({}, {
+  __index = function()
+    return noop
+  end,
+  __call = function()
+    return noop
+  end,
+})
+
+hl = setmetatable({
+  dsp = dsp_proxy("hl.dsp"),
+  bind = function(keys, bind_dispatcher, opts)
+    opts = opts or {}
+
+    if opts.description and opts.description ~= "" then
+      local modmask, key = split_keys(keys)
+      local kind = ""
+      local arg = ""
+
+      if type(bind_dispatcher) == "table" and bind_dispatcher.__omarchy_dispatcher then
+        kind = bind_dispatcher.kind or ""
+        arg = bind_dispatcher.arg or bind_dispatcher.expr or ""
+      elseif type(bind_dispatcher) == "string" and bind_dispatcher ~= "" then
+        kind = "exec"
+        arg = bind_dispatcher
+      end
+
+      print(table.concat({ tostring(modmask), opts.description, key, kind, arg }, "\t"))
+    end
+
+    return noop
+  end,
+  get_config = function()
+    return nil
+  end,
+}, {
+  __index = function()
+    return noop
+  end,
+})
+
+local config = os.getenv("HOME") .. "/.config/hypr/hyprland.lua"
+local file = io.open(config, "r")
+
+if file then
+  file:close()
+  local ok, err = pcall(dofile, config)
+  if not ok and os.getenv("DEBUG") == "1" then
+    io.stderr:write("[DEBUG] lua bind scan failed: " .. tostring(err) .. "\n")
+  end
+end
+LUA
+  )
+}
+
+modmask_to_text() {
+  case "$1" in
+    0)  printf '' ;;
+    1)  printf 'SHIFT' ;;
+    4)  printf 'CTRL' ;;
+    5)  printf 'SHIFT CTRL' ;;
+    8)  printf 'ALT' ;;
+    9)  printf 'SHIFT ALT' ;;
+    12) printf 'CTRL ALT' ;;
+    13) printf 'SHIFT CTRL ALT' ;;
+    64) printf 'SUPER' ;;
+    65) printf 'SUPER SHIFT' ;;
+    68) printf 'SUPER CTRL' ;;
+    69) printf 'SUPER SHIFT CTRL' ;;
+    72) printf 'SUPER ALT' ;;
+    73) printf 'SUPER SHIFT ALT' ;;
+    76) printf 'SUPER CTRL ALT' ;;
+    77) printf 'SUPER SHIFT CTRL ALT' ;;
+    *)  printf '%s' "$1" ;;
+  esac
+}
+
+dynamic_bindings() {
+  local modmask key keycode description dispatcher arg modifiers cache_key
+
+  hyprctl binds | awk '
+    function emit() {
+      if (!seen) return
+      seen = 0
+      printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n", f["modmask"], f["key"], f["keycode"], f["description"], f["dispatcher"], f["arg"]
+    }
+    /^bind/ { emit(); seen = 1; delete f; next }
+    seen && match($0, /^\t[a-z]+: /) { f[substr($0, 2, RLENGTH - 3)] = substr($0, RLENGTH + 1) }
+    END { emit() }
+  ' |
+    while IFS=$'\x1f' read -r modmask key keycode description dispatcher arg; do
+      key="${key##* + }"
+
+      if [[ -z $key && $keycode != "0" ]]; then
+        key="code:$keycode"
+      fi
+
+      if [[ -z $key && -n $description ]]; then
+        key="${LUA_BIND_KEY_MAP["$modmask,$description"]}"
+      fi
+
+      if [[ $dispatcher == "__lua" && -n $description && -n $key ]]; then
+        cache_key="$modmask,$description,$key"
+        dispatcher="${LUA_BIND_DISPATCHER_MAP["$cache_key"]}"
+        arg="${LUA_BIND_ARG_MAP["$cache_key"]}"
+      fi
+
+      [[ -z $description && $dispatcher == "__lua" ]] && continue
+
+      # The Copilot key just duplicates an existing binding, so keep it hidden
+      [[ $key == "code:201" ]] && continue
+
+      case "$key" in
+        comma) key="COMMA" ;;
+        period) key="PERIOD" ;;
+        minus) key="MINUS" ;;
+        equal) key="EQUAL" ;;
+        slash) key="SLASH" ;;
+      esac
+
+      modifiers=$(modmask_to_text "$modmask")
+      arg="${arg//~\/.local\/share\/omarchy\/bin\//}"
+
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$modifiers" "$key" "$description" "$dispatcher" "$arg"
+    done
+}
+
+static_bindings() {
+  printf 'SHIFT ALT\x1fL\x1fCopy URL from Web App\x1fsendshortcut\x1fSHIFT ALT,L,\n'
+  printf 'SHIFT ALT\x1fD\x1fDownload Video from Web App\x1fsendshortcut\x1fSHIFT ALT,D,\n'
+}
+
+derive_description() {
+  local dispatcher="$1" arg="$2" action="$3" candidate
+  if [[ -n $action ]]; then
+    printf '%s\n' "$action"
+    return
+  fi
+  candidate=$(sed -E 's/^(uwsm-app|uwsm app) --[[:space:]]*//' <<<"$arg")
+  candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+  candidate="${candidate%"${candidate##*[![:space:]]}"}"
+  [[ -z $candidate ]] && candidate="$dispatcher"
+  printf '%s\n' "$candidate"
+}
+
+to_json() {
+  local mods key description dispatcher arg mods_json
+  {
+    while IFS=$'\x1f' read -r mods key description dispatcher arg; do
+      [[ -z $key ]] && continue
+      key=$(tr '[:lower:]' '[:upper:]' <<<"$key")
+      description=$(derive_description "$dispatcher" "$arg" "$description")
+      [[ -z $description ]] && continue
+      if [[ -z $mods ]]; then
+        mods_json="[]"
+      else
+        mods_json=$(tr '[:lower:]' '[:upper:]' <<<"$mods" | tr ' ' '\n' | jq -R . | jq -s -c .)
+      fi
+      jq -nc --argjson mods "$mods_json" --arg key "$key" --arg description "$description" \
+        --arg dispatcher "$dispatcher" --arg arg "$arg" \
+        '{mods: $mods, key: $key, description: $description, dispatcher: $dispatcher, arg: $arg}'
+    done
+  } | jq -s -c .
+}
+
+main() {
+  build_lua_bind_cache
+  { dynamic_bindings; static_bindings; } | sort -u | parse_keycodes | to_json
+}
+
+main

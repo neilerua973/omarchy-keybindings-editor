@@ -1,0 +1,274 @@
+#!/usr/bin/env node
+// keybindings-write — rebind a key combo and/or change what it launches, for
+// the Keybindings Visualizer + Editor panel.
+//
+// Takes exactly one argv: a JSON payload —
+//   {
+//     "description": "Firefox",
+//     "oldCombo": "SUPER + SHIFT + R",   // combo currently live for this
+//                                        // binding; equals newCombo when
+//                                        // assigning a brand-new shortcut
+//                                        // to a previously unbound key
+//     "newCombo": "SUPER + SHIFT + R",
+//     "target": { "kind": "exec" | "launch" | "webapp", "value": "..." },
+//     "allowRevertShortcut": true | false
+//   }
+//
+// "target.value" is, per kind: exec -> a raw shell command; launch -> a
+// shell command too (the panel builds "gtk-launch <id>.desktop", matching
+// how Omarchy's own app launcher starts apps); webapp -> a URL. These map
+// to o.bind's three accepted forms (see helpers.lua's command_from): a
+// plain string, { launch = ... }, or { webapp = ... }.
+//
+// Scope (deliberately narrow, see README "Editing" section): only accepts
+// new combos made of SUPER + optional SHIFT/CTRL/ALT + one letter, digit,
+// or F-key. The panel enforces this before ever invoking this script;
+// this script re-validates it so it is never the sole guard against a
+// malformed bind.
+//
+// Never edits /usr/share/omarchy — always appends to the user's own
+// ~/.config/hypr/bindings.lua, inside one clearly-delimited managed
+// section, one block per edited binding:
+//
+//   -- ming.keybindings:managed {"originalCombo":"SUPER + SHIFT + R","description":"Firefox"}
+//   hl.unbind("SUPER + SHIFT + R")
+//   o.bind("SUPER + SHIFT + R", "Firefox", { launch = "gtk-launch firefox.desktop" })
+//
+// "originalCombo" is the combo that was ACTUALLY live the first time this
+// tool ever touched this key slot — frozen once and reused on every later
+// edit, so the tool always removes the true default/previous binding
+// instead of stacking dead unbind lines. Identity is by *combo*, not
+// description: a block is found by checking whether its own o.bind line's
+// combo equals the binding's current live combo, so changing the app
+// (which changes the description) still finds and replaces the same
+// block instead of leaving an orphaned one behind.
+//
+// Safety net: after writing, this script reloads Hyprland and checks
+// `hyprctl configerrors`. Any error rolls the file back to its pre-write
+// state and reloads again, so a bad edit can never leave the user's
+// keybindings (or Hyprland config) broken.
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+const MARKER_PREFIX = '-- ming.keybindings:managed ';
+const SECTION_HEADER = '-- === ming.keybindings-editor: managed edits (auto-generated, do not hand-edit) ===';
+const ALLOWED_MODS = new Set(['SUPER', 'SHIFT', 'CTRL', 'ALT']);
+const KEY_RE = /^([A-Z0-9]|F[1-9]|F1[0-2])$/;
+const TARGET_KINDS = new Set(['exec', 'launch', 'webapp']);
+
+function fail(message) {
+  process.stdout.write('ERROR:' + message + '\n');
+  process.exit(1);
+}
+
+function luaEscape(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+function parseCombo(combo) {
+  const parts = String(combo).split('+').map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  const key = parts[parts.length - 1].toUpperCase();
+  const mods = parts.slice(0, -1).map((m) => m.toUpperCase());
+  if (!KEY_RE.test(key)) return null;
+  for (const mod of mods) {
+    if (!ALLOWED_MODS.has(mod)) return null;
+  }
+  if (!mods.includes('SUPER')) return null;
+  return { mods, key };
+}
+
+function normalizedCombo(combo) {
+  const parsed = parseCombo(combo);
+  if (!parsed) return null;
+  const order = ['SUPER', 'SHIFT', 'CTRL', 'ALT'];
+  const sorted = order.filter((m) => parsed.mods.includes(m));
+  return [...sorted, parsed.key].join(' + ');
+}
+
+function comboMatches(binding, combo) {
+  const parsed = parseCombo(combo);
+  if (!parsed) return false;
+  const mods = (binding.mods || []).slice().map((m) => String(m).toUpperCase()).sort().join(' ');
+  const wantMods = parsed.mods.slice().sort().join(' ');
+  return mods === wantMods && String(binding.key).toUpperCase() === parsed.key;
+}
+
+function targetExpr(target) {
+  const esc = luaEscape(target.value);
+  if (target.kind === 'launch') return `{ launch = "${esc}" }`;
+  if (target.kind === 'webapp') return `{ webapp = "${esc}" }`;
+  return `"${esc}"`;
+}
+
+// Extracts the combo string from a managed block's `o.bind("COMBO", ...)`
+// line. normalizedCombo() output only ever contains [A-Z0-9+ ], so a plain
+// first-quoted-string match is safe here.
+function comboFromBindLine(line) {
+  const m = /^o\.bind\("([^"]*)"/.exec(line || '');
+  return m ? m[1] : null;
+}
+
+function main() {
+  const raw = process.argv[2];
+  if (!raw) fail('usage: keybindings-write <json-payload>');
+
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (e) {
+    fail('payload is not valid JSON');
+    return;
+  }
+
+  const { description, oldCombo, newCombo: newComboRaw, target, allowRevertShortcut } = payload;
+  if (!description || !oldCombo || !newComboRaw || !target || !TARGET_KINDS.has(target.kind) || typeof target.value !== 'string') {
+    fail('payload must include description, oldCombo, newCombo, and target: { kind: exec|launch|webapp, value }');
+    return;
+  }
+
+  const newCombo = normalizedCombo(newComboRaw);
+  if (!newCombo) {
+    fail('new combo must be SUPER plus optional SHIFT/CTRL/ALT plus one letter, digit, or F-key');
+    return;
+  }
+
+  // Re-check against the live binding set — the panel already does this
+  // before calling us, but this script must never be the sole guard
+  // against silently shadowing someone else's shortcut. The slot we're
+  // about to vacate (oldCombo) is excluded: that's the binding we're
+  // replacing, not a conflict (this matters for "change app", where
+  // oldCombo === newCombo).
+  const dataScript = path.join(__dirname, 'keybindings-data');
+  let live = [];
+  try {
+    live = JSON.parse(execFileSync(dataScript).toString() || '[]');
+  } catch (e) {
+    live = [];
+  }
+  const conflict = live.find((b) => !comboMatches(b, oldCombo) && comboMatches(b, newCombo));
+  if (conflict) {
+    fail('combo already used by: ' + conflict.description);
+    return;
+  }
+
+  const home = os.homedir();
+  const bindingsPath = path.join(home, '.config', 'hypr', 'bindings.lua');
+  const original = fs.readFileSync(bindingsPath, 'utf8');
+  const lines = original.split('\n');
+
+  // Find the managed block currently occupying oldCombo (by its own
+  // o.bind line's combo, not by description — description may be
+  // changing right now, e.g. swapping which app a key launches).
+  let frozenOriginal = null;
+  let removeStart = -1;
+  let removeEnd = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].startsWith(MARKER_PREFIX)) continue;
+    let markerPayload;
+    try {
+      markerPayload = JSON.parse(lines[i].slice(MARKER_PREFIX.length));
+    } catch (e) {
+      continue;
+    }
+    const bindCombo = comboFromBindLine(lines[i + 2]);
+    if (!bindCombo || normalizedCombo(bindCombo) !== normalizedCombo(oldCombo)) continue;
+    frozenOriginal = markerPayload.originalCombo;
+    removeStart = i;
+    removeEnd = i + 2; // marker + hl.unbind + o.bind
+    break;
+  }
+
+  const originalCombo = frozenOriginal || normalizedCombo(oldCombo) || oldCombo;
+  const currentLive = normalizedCombo(oldCombo) || oldCombo;
+
+  // True no-op: plain Rebind (target unchanged by construction) capturing
+  // the same combo the binding already has. Only safe to special-case
+  // here for the Rebind flow — assign flows (allowRevertShortcut: false)
+  // always write, since "same combo" there can still mean "different app".
+  if (allowRevertShortcut && currentLive === newCombo) {
+    process.stdout.write('OK:noop\n');
+    return;
+  }
+
+  let outLines = lines.slice();
+  if (removeStart !== -1) {
+    outLines.splice(removeStart, removeEnd - removeStart + 1);
+  }
+
+  // Pure rebind (action unchanged) landing back on the pristine original
+  // combo: drop the managed block entirely instead of writing a pointless
+  // unbind-then-rebind-to-the-same-key pair, so a full revert leaves the
+  // file exactly as it was before this tool ever touched this binding.
+  // Never applies when the action itself is being changed (assign flow):
+  // there we always need the explicit override, since the original
+  // default action differs from whatever is being assigned now.
+  if (allowRevertShortcut && target.kind === 'exec' && normalizedCombo(originalCombo) === newCombo) {
+    let text = outLines.join('\n');
+    if (removeStart !== -1) {
+      const hasOtherManaged = outLines.some((l) => l.startsWith(MARKER_PREFIX));
+      if (!hasOtherManaged) {
+        text = text.replace(new RegExp('\\n*' + SECTION_HEADER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$'), '\n');
+      }
+    }
+    const backupPath = bindingsPath + '.bak.' + Date.now();
+    fs.writeFileSync(backupPath, original);
+    fs.writeFileSync(bindingsPath, text.replace(/\n*$/, '\n'));
+    if (!reloadAndVerify(bindingsPath, original)) return;
+    process.stdout.write('OK:reverted\n');
+    return;
+  }
+
+  const marker = MARKER_PREFIX + JSON.stringify({ originalCombo, description });
+  const unbind = `hl.unbind("${luaEscape(originalCombo)}")`;
+  const bind = `o.bind("${luaEscape(newCombo)}", "${luaEscape(description)}", ${targetExpr(target)})`;
+
+  // Trim trailing blank lines so the managed section always sits right at
+  // the end of the file, with exactly one blank line separating it from
+  // whatever the user has above.
+  while (outLines.length > 0 && outLines[outLines.length - 1].trim() === '') {
+    outLines.pop();
+  }
+
+  const hasSection = outLines.some((l) => l.trim() === SECTION_HEADER);
+  const newText = outLines.join('\n')
+    + (hasSection ? '\n' : '\n\n' + SECTION_HEADER + '\n')
+    + marker + '\n' + unbind + '\n' + bind + '\n';
+
+  const backupPath = bindingsPath + '.bak.' + Date.now();
+  fs.writeFileSync(backupPath, original);
+  fs.writeFileSync(bindingsPath, newText);
+
+  if (!reloadAndVerify(bindingsPath, original)) return;
+  process.stdout.write('OK\n');
+}
+
+// Reloads Hyprland and checks hyprctl configerrors. On any error, restores
+// `original` to `bindingsPath`, reloads again (best effort), reports the
+// error, and returns false. Returns true when the reload was clean.
+function reloadAndVerify(bindingsPath, original) {
+  try {
+    execFileSync('hyprctl', ['reload'], { stdio: 'ignore' });
+  } catch (e) {
+    // fall through to configerrors check / rollback below
+  }
+
+  const errors = execFileSync('hyprctl', ['configerrors']).toString().trim();
+  if (errors.length > 0) {
+    fs.writeFileSync(bindingsPath, original);
+    try {
+      execFileSync('hyprctl', ['reload'], { stdio: 'ignore' });
+    } catch (e) {
+      // best effort
+    }
+    fail('hyprctl reported config errors, change rolled back: ' + errors.replace(/\n/g, ' / '));
+    return false;
+  }
+  return true;
+}
+
+main();
