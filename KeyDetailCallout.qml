@@ -116,7 +116,15 @@ Item {
           width: parent.width
           spacing: Style.spacing.xxs
 
-          readonly property bool editable: modelData.dispatcher === "exec"
+          // Rebind reuses modelData.arg verbatim as the new binding's
+          // command (see execTargetFor in KeybindingsPanel.applyRebind),
+          // so it only makes sense for bindings whose arg already IS a
+          // shell command — i.e. dispatcher === "exec". Assigning an app
+          // has no such requirement: it always replaces the action
+          // outright, so it's offered for every binding regardless of
+          // dispatcher (this is what lets a core WM shortcut like
+          // movefocus/workspace get an app attached to it).
+          readonly property bool rebindable: modelData.dispatcher === "exec"
           readonly property bool isRecording: root.recordingBinding === modelData
 
           Text {
@@ -143,16 +151,17 @@ Item {
           }
 
           Row {
-            visible: editable && !isRecording
+            visible: !isRecording
             spacing: Style.spacing.sm
             Button {
+              visible: rebindable
               text: "Rebind"
               fontSize: Style.font.caption
               bordered: true
               onClicked: root.rebindRequested(modelData)
             }
             Button {
-              text: "Change app"
+              text: rebindable ? "Change app" : "Add app"
               fontSize: Style.font.caption
               bordered: true
               onClicked: root.changeAppRequested(modelData)

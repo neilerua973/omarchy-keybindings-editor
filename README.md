@@ -15,20 +15,28 @@ Search (top right) filters the keyboard highlighting live.
 
 ## Editing
 
-Bindings whose action is a plain command (i.e. `dispatcher === "exec"` —
-covers everything declared via `o.bind(keys, description, command)`,
-which is virtually every app-launch/toggle/webapp shortcut) show two
-buttons in the detail card:
+Every binding shows an **Change app**/**Add app** button in the detail
+card (labeled "Change app" when it already launches something, "Add
+app" when it doesn't — e.g. a core window-manager dispatcher like
+`movefocus` or `workspace`): pick a different installed application
+(searchable, backed by Quickshell's `DesktopEntries`, launched the same
+way Omarchy's own app launcher does: `gtk-launch <id>.desktop`) or type
+a web app's name + URL. The key combo stays put; only the action
+changes — this works on *any* binding, including core WM ones, so
+using it on e.g. `SHIFT + ALT + Tab` (focus previous window) replaces
+that action with the app you pick. There's no undo button for this in
+the panel; see "Removing a shortcut entirely" below.
 
-- **Rebind** — click it, press the new shortcut (must include Super,
-  plus optionally Shift/Ctrl/Alt, plus one letter, digit, or F-key),
-  and it's applied immediately. Only the key combo changes; the action
-  stays whatever it already was.
-- **Change app** — pick a different installed application (searchable,
-  backed by Quickshell's `DesktopEntries`, launched the same way
-  Omarchy's own app launcher does: `gtk-launch <id>.desktop`) or type a
-  web app's name + URL. The key combo stays put; only the action
-  changes.
+Bindings whose action is already a plain command (i.e. `dispatcher ===
+"exec"` — covers everything declared via `o.bind(keys, description,
+command)`, which is virtually every app-launch/toggle/webapp shortcut)
+additionally show a **Rebind** button: click it, press the new shortcut
+(must include Super, plus optionally Shift/Ctrl/Alt, plus one letter,
+digit, or F-key), and it's applied immediately. Only the key combo
+changes; the action stays whatever it already was. Rebind isn't offered
+for non-`exec` bindings (it would reinterpret their dispatcher argument,
+e.g. `movefocus`'s `l`, as a shell command to preserve — meaningless
+outside `exec`).
 
 Clicking an **unbound** key (dashed accent border on hover) opens the
 same Application/Web app picker to assign a brand-new shortcut there,
@@ -38,9 +46,6 @@ offered when that layer includes Super, since a fresh combo always
 needs it.
 
 Deliberately out of scope, to keep this safe:
-- Core window-manager bindings (move focus, resize, workspace switch,
-  …) — their dispatcher isn't `exec`, so no Rebind/Change app button
-  appears, and their keys aren't offered for fresh assignment either.
 - Punctuation/symbol/media/arrow keys as the combo being written to —
   only letters, digits, and F1-F12 are accepted, since those are the
   only key names this tool has verified round-trip correctly through
