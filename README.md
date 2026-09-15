@@ -15,7 +15,7 @@ Search (top right) filters the keyboard highlighting live.
 
 ## Editing
 
-Every binding shows an **Change app**/**Add app** button in the detail
+Every binding shows a **Change app**/**Add app** button in the detail
 card (labeled "Change app" when it already launches something, "Add
 app" when it doesn't — e.g. a core window-manager dispatcher like
 `movefocus` or `workspace`): pick a different installed application
