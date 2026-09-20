@@ -1,0 +1,231 @@
+#!/usr/bin/env node
+// zen-webapp-create — registers a URL as a Zen "taskbar tab" (Zen's own
+// web-app mechanism) and emits the desktop id that launches it, for the
+// panel's "Open with: Zen Browser" web-app flow.
+//
+// Zen is Firefox-based, so omarchy-launch-webapp ignores it entirely (see
+// its browser case list) and falls back to Chromium. A Zen web app is not
+// a command-line flag either: the window is chromeless only when the tab
+// id already exists in the profile's taskbartabs.json, so it has to be
+// registered there first. That is what this script does.
+//
+// Takes exactly one argv: a JSON payload —
+//   { "name": "YouTube", "url": "https://www.youtube.com/" }
+//
+// Prints, on success:
+//   OK:zen.webapp-<uuid>
+//   NOTE:restart-zen        (only when Zen is currently running)
+//
+// The desktop id is deliberately printed WITHOUT the ".desktop" suffix so
+// the panel can hand it straight to WriteTarget.launchTargetFor(), the
+// same helper the "Application" picker uses.
+//
+// NOTE:restart-zen matters because a running Zen read taskbartabs.json at
+// startup: the shortcut works, but the window only goes chromeless once
+// Zen has been restarted.
+//
+// Writes three things, all inside the user's own directories — never
+// /usr/share/omarchy, and never an existing entry (a fresh uuid per run):
+//   ~/.config/zen/<profile>/taskbartabs/taskbartabs.json   (appended to,
+//                                                           backed up first)
+//   ~/.config/zen/<profile>/taskbartabs/icons/<uuid>.png
+//   ~/.local/share/applications/zen.webapp-<uuid>.desktop
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync, randomUUID } = (() => ({
+  execFileSync: require('child_process').execFileSync,
+  randomUUID: require('crypto').randomUUID
+}))();
+
+const ZEN_BIN = '/opt/zen-browser-bin/zen-bin';
+const ICON_THEME_DIRS = [
+  '/usr/share/icons/hicolor/256x256/apps',
+  '/usr/share/icons/hicolor/128x128/apps',
+  '/usr/share/icons/hicolor/64x64/apps',
+  '/usr/share/icons/hicolor/48x48/apps'
+];
+const FALLBACK_ICON_NAME = 'zen-browser';
+
+function fail(message) {
+  process.stdout.write('ERROR:' + message + '\n');
+  process.exit(1);
+}
+
+// Picks the profile Zen actually runs. profiles.ini's [Install…] section
+// is authoritative — its Default= is the profile Zen opens — and a stale
+// "Default=1" on some other [ProfileN] must not win over it (this machine
+// has exactly that disagreement). Falls back to whichever profile already
+// holds a taskbartabs directory, then to Default=1.
+function resolveProfileDir(home) {
+  const zenRoot = path.join(home, '.config', 'zen');
+  const iniPath = path.join(zenRoot, 'profiles.ini');
+  if (!fs.existsSync(iniPath)) return null;
+
+  const sections = [];
+  let current = null;
+  for (const rawLine of fs.readFileSync(iniPath, 'utf8').split('\n')) {
+    const line = rawLine.trim();
+    const header = /^\[(.+)\]$/.exec(line);
+    if (header) {
+      current = { name: header[1], keys: {} };
+      sections.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    current.keys[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+
+  const candidates = [];
+  const install = sections.find((s) => s.name.startsWith('Install') && s.keys.Default);
+  if (install) candidates.push(install.keys.Default);
+  const profiles = sections.filter((s) => /^Profile\d+$/.test(s.name) && s.keys.Path);
+  for (const p of profiles) {
+    if (fs.existsSync(path.join(zenRoot, p.keys.Path, 'taskbartabs'))) candidates.push(p.keys.Path);
+  }
+  for (const p of profiles) {
+    if (p.keys.Default === '1') candidates.push(p.keys.Path);
+  }
+
+  for (const relative of candidates) {
+    const dir = path.isAbsolute(relative) ? relative : path.join(zenRoot, relative);
+    if (fs.existsSync(dir)) return dir;
+  }
+  return null;
+}
+
+// Best-effort icon: a themed icon matching the web app's name if one
+// happens to be installed (youtube.png, spotify.png…), otherwise Zen's
+// own. Either way Zen replaces it with the site's favicon once the web
+// app has been opened, so this only has to look right until then.
+function sourceIconFor(name) {
+  const slug = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const names = slug ? [slug, FALLBACK_ICON_NAME] : [FALLBACK_ICON_NAME];
+  for (const iconName of names) {
+    for (const dir of ICON_THEME_DIRS) {
+      const candidate = path.join(dir, iconName + '.png');
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function zenIsRunning() {
+  try {
+    execFileSync('pgrep', ['-f', ZEN_BIN], { stdio: 'ignore' });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function main() {
+  const raw = process.argv[2];
+  if (!raw) fail('usage: zen-webapp-create <json-payload>');
+
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (e) {
+    fail('payload is not valid JSON');
+    return;
+  }
+
+  const name = String(payload.name || '').trim();
+  const url = String(payload.url || '').trim();
+  if (!name || !url) {
+    fail('payload must include name and url');
+    return;
+  }
+
+  let hostname;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('scheme');
+    hostname = parsed.hostname;
+  } catch (e) {
+    fail('url must be a http(s) address');
+    return;
+  }
+
+  if (!fs.existsSync(ZEN_BIN)) {
+    fail('Zen binary not found at ' + ZEN_BIN);
+    return;
+  }
+
+  const home = os.homedir();
+  const profileDir = resolveProfileDir(home);
+  if (!profileDir) {
+    fail('no Zen profile found under ~/.config/zen');
+    return;
+  }
+
+  const taskbarDir = path.join(profileDir, 'taskbartabs');
+  const iconsDir = path.join(taskbarDir, 'icons');
+  const storePath = path.join(taskbarDir, 'taskbartabs.json');
+  fs.mkdirSync(iconsDir, { recursive: true });
+
+  let store = { version: 1, taskbarTabs: [] };
+  if (fs.existsSync(storePath)) {
+    const original = fs.readFileSync(storePath, 'utf8');
+    try {
+      store = JSON.parse(original);
+    } catch (e) {
+      fail('taskbartabs.json is not valid JSON — not touching it');
+      return;
+    }
+    fs.writeFileSync(storePath + '.bak.' + Date.now(), original);
+  }
+  if (!Array.isArray(store.taskbarTabs)) store.taskbarTabs = [];
+
+  const id = randomUUID();
+  const desktopId = 'zen.webapp-' + id;
+  store.taskbarTabs.push({
+    id: id,
+    scopes: [{ hostname: hostname, prefix: '/' }],
+    userContextId: 1,
+    startUrl: url,
+    name: name,
+    shortcutRelativePath: desktopId + '.desktop'
+  });
+
+  const iconPath = path.join(iconsDir, id + '.png');
+  const sourceIcon = sourceIconFor(name);
+  if (sourceIcon) fs.copyFileSync(sourceIcon, iconPath);
+
+  // Matches the shortcuts Zen writes itself: quoted argv, -taskbar-tab
+  // before -new-window, profile passed explicitly (the path contains a
+  // space), container 1.
+  const exec = [ZEN_BIN, '-taskbar-tab', id, '-new-window', url, '-profile', profileDir, '-container', '1']
+    .map((part) => '"' + part + '"')
+    .join(' ');
+  const desktop = [
+    '[Desktop Entry]',
+    'Type=Application',
+    'Version=1.5',
+    'Name=' + name,
+    'Icon=' + (sourceIcon ? iconPath : FALLBACK_ICON_NAME),
+    'Exec=' + exec,
+    ''
+  ].join('\n');
+
+  const applicationsDir = path.join(home, '.local', 'share', 'applications');
+  fs.mkdirSync(applicationsDir, { recursive: true });
+  fs.writeFileSync(path.join(applicationsDir, desktopId + '.desktop'), desktop);
+  fs.writeFileSync(storePath, JSON.stringify(store));
+
+  try {
+    execFileSync('update-desktop-database', [applicationsDir], { stdio: 'ignore' });
+  } catch (e) {
+    // Optional: gtk-launch resolves the file directly even without the cache.
+  }
+
+  process.stdout.write('OK:' + desktopId + '\n');
+  if (zenIsRunning()) process.stdout.write('NOTE:restart-zen\n');
+}
+
+main();

@@ -27,6 +27,30 @@ using it on e.g. `SHIFT + ALT + Tab` (focus previous window) replaces
 that action with the app you pick. There's no undo button for this in
 the panel; see "Removing a shortcut entirely" below.
 
+The web app form also has an **Open with** dropdown, listing the
+browsers on this machine that can host a web app (`bin/webapp-browsers`
+enumerates them). It matters because Omarchy's own launcher only
+recognises the Chromium family: with Zen or Firefox as the system
+default browser, `omarchy-launch-webapp` silently falls back to
+Chromium, so a web app bound here would open in a browser you don't
+use. The dropdown preselects the system default browser whenever that
+browser can host a web app itself. Each choice writes a different
+binding:
+
+| Choice | What gets written |
+| --- | --- |
+| Omarchy default | `{ webapp = url }` — follows the default browser, with the Chromium fallback described above |
+| Zen Browser | `{ launch = "gtk-launch zen.webapp-<uuid>.desktop" }`, after `bin/zen-webapp-create` registers the URL as a Zen taskbar tab |
+| Chromium/Chrome/Brave/… | `{ launch = "<browser> --app='<url>'" }`, pinned to that browser |
+
+Zen is the one that needs more than a command line: its web-app window
+is chromeless only once the tab id exists in the profile's
+`taskbartabs.json`, so `bin/zen-webapp-create` appends it there (backing
+the file up first), copies an icon, and writes the `.desktop` shortcut.
+If Zen is running at that moment the panel says so — the shortcut works
+right away, but the window stays a normal Zen window until Zen has been
+restarted.
+
 Bindings whose action is already a plain command (i.e. `dispatcher ===
 "exec"` — covers everything declared via `o.bind(keys, description,
 command)`, which is virtually every app-launch/toggle/webapp shortcut)
@@ -153,6 +177,11 @@ parsing approach as Omarchy's own `omarchy-menu-keybindings`, but emits
 structured JSON (including the dispatcher/command) instead of a
 flattened display string. See the header comment in that script for the
 reasoning and its known coupling to `hyprctl binds`' text format.
+
+`bin/webapp-browsers` enumerates the browsers offered in the web app
+form's "Open with" dropdown, and `bin/zen-webapp-create` registers a URL
+as a Zen taskbar tab so it can be launched as a real web app. Both print
+their contract in their header comment.
 
 ## Tests
 

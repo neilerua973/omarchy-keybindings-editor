@@ -1,0 +1,113 @@
+#!/usr/bin/env node
+// webapp-browsers — lists the browsers that can host a web app on this
+// machine, for the panel's "Open with" dropdown.
+//
+// Prints a JSON array, most useful first. Each row is a
+// SearchableDropdown/Dropdown option plus the fields the panel needs to
+// build a write target:
+//
+//   { "value": "default", "label": "Omarchy default",
+//     "kind": "webapp", "isDefault": false }
+//   { "value": "zen", "label": "Zen Browser",
+//     "kind": "zen", "isDefault": true }
+//   { "value": "chromium", "label": "Chromium",
+//     "kind": "chromium", "exec": "/usr/bin/chromium", "isDefault": false }
+//
+// The three kinds map to the three ways a web app can actually be
+// launched here:
+//   webapp   -> o.bind { webapp = url }, i.e. omarchy-launch-webapp.
+//               Follows the system default browser, but only recognises
+//               Chromium-family browsers and silently falls back to
+//               Chromium for anything else (Zen and Firefox included).
+//   chromium -> that browser's own --app= window, pinned to one browser
+//               regardless of what the system default later becomes.
+//   zen      -> a registered Zen taskbar tab (see bin/zen-webapp-create).
+//
+// "isDefault" marks the row matching the system default browser, so the
+// panel can preselect the browser the user actually browses with instead
+// of always defaulting to Omarchy's Chromium fallback.
+
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync } = require('child_process');
+
+// Chromium-family browsers, in the order omarchy-launch-webapp's own case
+// list names them. Keyed by desktop id so a row can be matched against
+// `xdg-settings get default-web-browser`.
+const CHROMIUM_BROWSERS = [
+  { desktop: 'google-chrome.desktop', label: 'Google Chrome', bins: ['google-chrome-stable', 'google-chrome'] },
+  { desktop: 'brave-browser.desktop', label: 'Brave', bins: ['brave', 'brave-browser'] },
+  { desktop: 'microsoft-edge.desktop', label: 'Microsoft Edge', bins: ['microsoft-edge-stable', 'microsoft-edge'] },
+  { desktop: 'vivaldi-stable.desktop', label: 'Vivaldi', bins: ['vivaldi-stable', 'vivaldi'] },
+  { desktop: 'opera.desktop', label: 'Opera', bins: ['opera'] },
+  { desktop: 'helium.desktop', label: 'Helium', bins: ['helium'] },
+  { desktop: 'chromium.desktop', label: 'Chromium', bins: ['chromium'] }
+];
+
+const ZEN_BIN = '/opt/zen-browser-bin/zen-bin';
+const ZEN_DESKTOP_IDS = ['zen.desktop', 'zen-browser.desktop'];
+
+function which(bin) {
+  try {
+    return execFileSync('which', [bin], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim() || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function defaultBrowserDesktopId() {
+  try {
+    return execFileSync('xdg-settings', ['get', 'default-web-browser'], { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+// Zen can only host a web app once the tab is registered in a profile's
+// taskbartabs.json, so a Zen install with no profile directory at all is
+// not offerable here.
+function zenAvailable(home) {
+  if (!fs.existsSync(ZEN_BIN)) return false;
+  const zenRoot = path.join(home, '.config', 'zen');
+  if (!fs.existsSync(zenRoot)) return false;
+  return fs.readdirSync(zenRoot).some((entry) => fs.existsSync(path.join(zenRoot, entry, 'prefs.js')));
+}
+
+function main() {
+  const home = os.homedir();
+  const defaultDesktop = defaultBrowserDesktopId();
+  const rows = [{ value: 'default', label: 'Omarchy default', kind: 'webapp', isDefault: false }];
+
+  if (zenAvailable(home)) {
+    rows.push({
+      value: 'zen',
+      label: 'Zen Browser',
+      kind: 'zen',
+      isDefault: ZEN_DESKTOP_IDS.indexOf(defaultDesktop) !== -1
+    });
+  }
+
+  for (const browser of CHROMIUM_BROWSERS) {
+    let exec = null;
+    for (const bin of browser.bins) {
+      exec = which(bin);
+      if (exec) break;
+    }
+    if (!exec) continue;
+    rows.push({
+      value: path.basename(exec),
+      label: browser.label,
+      kind: 'chromium',
+      exec: exec,
+      isDefault: browser.desktop === defaultDesktop
+    });
+  }
+
+  process.stdout.write(JSON.stringify(rows) + '\n');
+}
+
+main();

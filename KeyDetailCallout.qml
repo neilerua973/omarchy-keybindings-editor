@@ -28,17 +28,31 @@ Item {
   property var appOptions: []   // [{ value: desktopId, label: name, description }]
   property string assignKind: "app" // "app" | "webapp", local UI-only state
 
+  // Which browser opens a newly bound web app (see bin/webapp-browsers).
+  // The panel owns the value so the choice carries across popups within a
+  // session; this component only reads it and reports changes back.
+  property var browserOptions: []
+  property string webappBrowser: "default"
+
   signal dismissRequested()
   signal rebindRequested(var binding)
   signal cancelRebindRequested()
   signal changeAppRequested(var binding)
   signal confirmAppRequested(string desktopId, string appName)
   signal confirmWebappRequested(string name, string url)
+  // Not named webappBrowserChanged: QML already generates that signal for
+  // the property above, and redeclaring it is an error.
+  signal browserSelected(string value)
   signal cancelAssignRequested()
 
   readonly property real _extraRowHeight: Style.space(34)
+  // The web-app form is the taller of the two assign modes: two text
+  // fields plus the "Open with" dropdown, where the app mode has a single
+  // searchable field.
   readonly property real cardHeight: Math.min(railBottom - railTop,
-    root.assigning ? Style.space(340) : Style.space(60) + bindings.length * (Style.space(46) + _extraRowHeight))
+    root.assigning
+      ? (root.assignKind === "webapp" ? Style.space(400) : Style.space(340))
+      : Style.space(60) + bindings.length * (Style.space(46) + _extraRowHeight))
   readonly property real cardY: Math.max(railTop, Math.min(anchorY - cardHeight / 2, railBottom - cardHeight))
   readonly property real arrowY: Math.max(Style.space(14), Math.min(anchorY - cardY, cardHeight - Style.space(14)))
 
@@ -251,6 +265,29 @@ Item {
             id: webappUrlField
             width: parent.width
             placeholderText: "https://…"
+          }
+
+          // Which browser hosts the web app. Worth surfacing because
+          // Omarchy's own launcher only recognises Chromium-family
+          // browsers: with Zen or Firefox set as the system default, the
+          // "Omarchy default" row still opens the web app in Chromium.
+          Dropdown {
+            id: browserDropdown
+            width: parent.width
+            label: "Open with"
+            options: root.browserOptions
+            value: root.webappBrowser
+            fontFamily: Style.font.family
+            onChanged: function(value) { root.browserSelected(value) }
+
+            // Dropdown assigns to its own `value` on selection, which
+            // breaks the binding above. Re-push the panel's value so a
+            // later change there (the initial preselect, most of all)
+            // still reaches the control.
+            Connections {
+              target: root
+              function onWebappBrowserChanged() { browserDropdown.value = root.webappBrowser }
+            }
           }
         }
 

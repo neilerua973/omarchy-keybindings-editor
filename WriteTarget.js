@@ -29,6 +29,14 @@ function webappTargetFor(url) {
   return { kind: "webapp", value: String(url) }
 }
 
+// A web app pinned to one specific Chromium-family browser, instead of
+// whichever one omarchy-launch-webapp picks. Same "launch" kind as
+// launchTargetFor: helpers.lua's o.launch already wraps the value in
+// "uwsm-app -- ", so this is the bare browser command line.
+function chromiumAppTargetFor(exec, url) {
+  return { kind: "launch", value: String(exec) + " --app=" + shellQuote(String(url)) }
+}
+
 function execTargetFor(command) {
   return { kind: "exec", value: String(command) }
 }
@@ -39,6 +47,7 @@ if (typeof module !== "undefined" && module.exports) {
     shellQuote: shellQuote,
     launchTargetFor: launchTargetFor,
     webappTargetFor: webappTargetFor,
+    chromiumAppTargetFor: chromiumAppTargetFor,
     execTargetFor: execTargetFor
   }
 }

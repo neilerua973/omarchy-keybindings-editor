@@ -23,6 +23,8 @@ Item {
     closingFromHost = false
     window.visible = true
     bindingsProc.running = true
+    browsersProc.running = true
+    noticeMessage = ""
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
 
@@ -64,6 +66,44 @@ Item {
   property var assignBinding: null
   property bool assigning: false
   property string assignError: ""
+
+  // Which browser opens a web app bound from here (see
+  // bin/webapp-browsers for the rows and what each kind writes).
+  // Preselected to the system default browser when that browser can host
+  // a web app itself: Omarchy's own launcher only recognises the
+  // Chromium family, so leaving this on "Omarchy default" would silently
+  // open web apps in Chromium on a Zen/Firefox desktop.
+  property var browserOptions: []
+  property string webappBrowser: "default"
+
+  // One-off notice shown next to the title after a successful write —
+  // currently only "a Zen web app was registered while Zen was running",
+  // which the callout can't report because it closes on success.
+  property bool pendingZenRestartNotice: false
+  property string noticeMessage: ""
+
+  function loadBrowsers(raw) {
+    var parsed = []
+    try {
+      parsed = JSON.parse(String(raw || "[]"))
+    } catch (e) {
+      parsed = []
+    }
+    root.browserOptions = Array.isArray(parsed) ? parsed : []
+    for (var i = 0; i < root.browserOptions.length; i++) {
+      if (root.browserOptions[i].isDefault) {
+        root.webappBrowser = String(root.browserOptions[i].value)
+        return
+      }
+    }
+  }
+
+  function selectedBrowser() {
+    for (var i = 0; i < root.browserOptions.length; i++) {
+      if (String(root.browserOptions[i].value) === root.webappBrowser) return root.browserOptions[i]
+    }
+    return null
+  }
 
   // Installed applications, as SearchableDropdown options. Quickshell's
   // DesktopEntries singleton (from `import Quickshell`) already scans
@@ -150,8 +190,48 @@ Item {
     root.applyAssign(appName, WriteTarget.launchTargetFor(desktopId))
   }
 
+  // Routes a web app to the chosen browser. Zen is the one kind that
+  // cannot be expressed as a command line: its web-app window is only
+  // chromeless once the tab is registered in the profile, so the binding
+  // is written after bin/zen-webapp-create reports the desktop id it
+  // created (see onZenWebappResult).
   function confirmAssignWebapp(name, url) {
+    var browser = root.selectedBrowser()
+    var kind = browser ? String(browser.kind) : "webapp"
+
+    if (kind === "zen") {
+      root.assignError = ""
+      zenWebappProc.pendingName = name
+      zenWebappProc.payload = JSON.stringify({ name: name, url: url })
+      zenWebappProc.running = true
+      return
+    }
+    if (kind === "chromium" && browser.exec) {
+      root.applyAssign(name, WriteTarget.chromiumAppTargetFor(browser.exec, url))
+      return
+    }
     root.applyAssign(name, WriteTarget.webappTargetFor(url))
+  }
+
+  function onZenWebappResult(text) {
+    var lines = String(text || "").trim().split("\n")
+    var desktopId = ""
+    var restartZen = false
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim()
+      if (line.indexOf("OK:") === 0) desktopId = line.slice("OK:".length)
+      else if (line === "NOTE:restart-zen") restartZen = true
+      else if (line.indexOf("ERROR:") === 0) {
+        root.assignError = line.slice("ERROR:".length)
+        return
+      }
+    }
+    if (!desktopId) {
+      root.assignError = "Could not create the Zen web app"
+      return
+    }
+    root.pendingZenRestartNotice = restartZen
+    root.applyAssign(zenWebappProc.pendingName, WriteTarget.launchTargetFor(desktopId))
   }
 
   function applyAssign(description, target) {
@@ -175,6 +255,8 @@ Item {
   function onWriteResult(text) {
     var trimmed = String(text || "").trim()
     var mode = writeProc.pendingMode
+    var zenRestart = root.pendingZenRestartNotice
+    root.pendingZenRestartNotice = false
     if (trimmed.indexOf("OK") === 0) {
       root.recordingBinding = null
       root.recordingError = ""
@@ -182,6 +264,9 @@ Item {
       root.assignBinding = null
       root.assignError = ""
       root.calloutInfo = null
+      root.noticeMessage = zenRestart
+        ? "Zen web app created — restart Zen for a chromeless window"
+        : ""
       bindingsProc.running = true
     } else if (trimmed.indexOf("ERROR:") === 0) {
       var msg = trimmed.slice("ERROR:".length)
@@ -238,6 +323,26 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.onWriteResult(text)
+    }
+  }
+
+  Process {
+    id: browsersProc
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/lemechant.keybindings-editor/bin/webapp-browsers"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadBrowsers(text)
+    }
+  }
+
+  Process {
+    id: zenWebappProc
+    property string payload: "{}"
+    property string pendingName: "" // description to bind once the tab exists
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/lemechant.keybindings-editor/bin/zen-webapp-create", payload]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onZenWebappResult(text)
     }
   }
 
@@ -328,6 +433,15 @@ Item {
                 color: root.accent
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.noticeMessage.length > 0
+                text: root.noticeMessage
+                color: Color.urgent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
               }
             }
 
@@ -507,6 +621,8 @@ Item {
               assigning: root.assigning
               assignError: root.assignError
               appOptions: root.appOptions
+              browserOptions: root.browserOptions
+              webappBrowser: root.webappBrowser
               onDismissRequested: {
                 root.recordingBinding = null
                 root.recordingError = ""
@@ -520,6 +636,7 @@ Item {
               onChangeAppRequested: function(binding) { root.startAssignForBinding(binding) }
               onConfirmAppRequested: function(desktopId, appName) { root.confirmAssignApp(desktopId, appName) }
               onConfirmWebappRequested: function(name, url) { root.confirmAssignWebapp(name, url) }
+              onBrowserSelected: function(value) { root.webappBrowser = value }
               onCancelAssignRequested: root.cancelAssign()
             }
           }
